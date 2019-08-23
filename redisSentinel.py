@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
-import redis, time, datetime, threading
+import redis, time, datetime, threading, BaseHTTPServer
 from redis.sentinel import Sentinel
+from BaseHTTPServer import BaseHTTPRequestHandler
+
 from wechat import *
 
 sentinels = [
@@ -11,16 +13,36 @@ sentinels = [
 ]
 
 '''
-    1、sentinal 连接不上
-        重连、报警
-        sentinal错误信息示例:
-            2 Error 111 connecting to 10.56.50.102:7803. Connection refused.
-    2、报警批量发送不逐条发送
-        单独线程检查报警信息
-    3、节点信息从dbop取，提供接口给dbop查看各节点状态
-        cluster_obj加字段subscribe_url
-    
+    1、提供接口检查各Sentinel运行状态
+        Sentinel端口不通不走企业微信报警，使用其他途径报警
+    2、订阅到状态变动发送企业微信
+        判断消息数量，每次不发送超过5条，保证企业微信消息不被阶段
 '''
+
+HTTP_HOST = '10.56.50.107'
+HTTP_PORT = 7803
+HTTP_DATA = {}
+
+
+class TodoHandler(BaseHTTPRequestHandler):
+    def __get_sentinel_data__(self):
+        global HTTP_DATA
+        r = [ {i: HTTP_DATA[i]['msg'] } for i in HTTP_DATA ]
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        return {'data': r, 'version': int(time.time())}
+
+    def do_GET(self):
+        self.wfile.write(json.dumps(self.__get_sentinel_data__()))
+
+    def do_POST(self):
+        self.wfile.write(json.dumps(self.__get_sentinel_data__()))
+
+
+def start_httpd(httpd):
+    httpd.serve_forever()
+
 
 class RdbClusterSubscribe:
     def __init__(self, sentinels):
@@ -57,6 +79,23 @@ class RdbClusterSubscribe:
             send_weixin_message(header + '\n'.join(msg_list), ['jiangxu', ])
         return len(msg_list)
 
+    def __pubsub_thread__(self, name):
+        while self.pubsub_dict[name]['msg'] == None and self.state == True:
+            try:
+                info = self.pubsub_dict[name]['pubsub'].get_message()
+                if info and type(info) == dict and info['pattern']:
+                    warning = "%s %s [%s] %s" % (
+                        str(datetime.datetime.now()),
+                        name,
+                        info['channel'],
+                        info['data']
+                    )
+                    self.__update_message__(warning)
+            except Exception, e:
+                self.__update_pubsub__(name, str(e))
+            time.sleep(0.5)
+        return None
+
     def start(self):
         cluster_obj = Sentinel(self.sentinels, socket_timeout = 0.5)
         for sentinel_obj in cluster_obj.sentinels:
@@ -68,7 +107,6 @@ class RdbClusterSubscribe:
             except Exception, e:
                 err, pubsub = str(e), None
             self.pubsub_dict[name] = {
-                'sentinel': sentinel_obj,
                 'pubsub': pubsub,
                 'msg': err
             }
@@ -81,31 +119,23 @@ class RdbClusterSubscribe:
                 thr_obj.setDaemon(True)
                 thr_obj.start()
 
-    def __pubsub_thread__(self, name):
-        while self.pubsub_dict[name]['msg'] == None:
-            try:
-                info = self.pubsub_dict[name]['pubsub'].get_message()
-                if info and type(info) == dict and info['pattern']:
-                    warning = "%s %s [%s] %s" % (
-                        str(datetime.datetime.now()),
-                        name,
-                        info['channel'],
-                        info['data']
-                    )
-                    self.__update_message__(warning)
-                time.sleep(0.5)
-            except Exception, e:
-                self.__update_pubsub__(name, str(e))
-        return None
+    def stop(self):
+        self.state = False
 
 
 if __name__ == '__main__':
+    httpd   = BaseHTTPServer.HTTPServer((HTTP_HOST, HTTP_PORT), TodoHandler)
+    api     = threading.Thread(target = start_httpd, name = 'HTTPServer', args=(httpd,))
+    api.start()
     s = RdbClusterSubscribe(sentinels)
     s.start()
-    n = 1
-    while n < 120:
-        msg_list = s.send_message()
-        time.sleep(10) 
-        n += 1
+    try:
+        while True:
+            msg_list    = s.send_message()
+            HTTP_DATA   = s.get_pubsub()
+            time.sleep(10) 
+    except KeyboardInterrupt, e:
+        for f in [s.stop, httpd.shutdown, api._Thread__stop ]:
+            f()
+    print str(datetime.datetime.now()), " END"
     exit(1)
-    print 'End'
